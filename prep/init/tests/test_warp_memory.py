@@ -49,19 +49,30 @@ def test_temporal_tracking_holds_at_most_one_dense_warp(monkeypatch):
     monkeypatch.setattr(MODULE, "validate_warp_layout", lambda *_: True)
     monkeypatch.setattr(
         MODULE,
-        "triangulate_multiview_dlt",
-        lambda *_: np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
-    )
-    monkeypatch.setattr(MODULE, "within_scene_bounds", lambda *_: True)
-    monkeypatch.setattr(
-        MODULE,
-        "compute_reprojection_errors",
-        lambda _x, obs, _cams: (
-            np.zeros(len(obs), dtype=np.float64),
-            np.ones(len(obs), dtype=np.float64),
+        "triangulate_multiview_dlt_batch",
+        lambda _cam, _uv, counts, _cams: (
+            np.tile(np.asarray([0.0, 0.0, 1.0], dtype=np.float64), (len(counts), 1)),
+            np.ones(len(counts), dtype=bool),
         ),
     )
-    monkeypatch.setattr(MODULE, "compute_triangulation_angle_deg", lambda *_: 90.0)
+    monkeypatch.setattr(
+        MODULE,
+        "within_scene_bounds_batch",
+        lambda x, *_: np.ones(len(x), dtype=bool),
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "compute_reprojection_errors_batch",
+        lambda _x, cam, _uv, _counts, _cams: (
+            np.zeros(len(cam), dtype=np.float64),
+            np.ones(len(cam), dtype=np.float64),
+        ),
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "compute_triangulation_angle_deg_batch",
+        lambda _x, _cam, counts, _cams: np.full(len(counts), 90.0),
+    )
 
     cameras = [
         SimpleNamespace(width=100, height=100),
@@ -157,19 +168,30 @@ def test_fresh_compensation_holds_at_most_one_dense_warp(monkeypatch):
     )
     monkeypatch.setattr(
         MODULE,
-        "triangulate_multiview_dlt",
-        lambda *_: np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
-    )
-    monkeypatch.setattr(MODULE, "within_scene_bounds", lambda *_: True)
-    monkeypatch.setattr(
-        MODULE,
-        "compute_reprojection_errors",
-        lambda _x, obs, _cams: (
-            np.zeros(len(obs), dtype=np.float64),
-            np.ones(len(obs), dtype=np.float64),
+        "triangulate_multiview_dlt_batch",
+        lambda _cam, _uv, counts, _cams: (
+            np.tile(np.asarray([0.0, 0.0, 1.0], dtype=np.float64), (len(counts), 1)),
+            np.ones(len(counts), dtype=bool),
         ),
     )
-    monkeypatch.setattr(MODULE, "compute_triangulation_angle_deg", lambda *_: 90.0)
+    monkeypatch.setattr(
+        MODULE,
+        "within_scene_bounds_batch",
+        lambda x, *_: np.ones(len(x), dtype=bool),
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "compute_reprojection_errors_batch",
+        lambda _x, cam, _uv, _counts, _cams: (
+            np.zeros(len(cam), dtype=np.float64),
+            np.ones(len(cam), dtype=np.float64),
+        ),
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "compute_triangulation_angle_deg_batch",
+        lambda _x, _cam, counts, _cams: np.full(len(counts), 90.0),
+    )
 
     cameras = [
         SimpleNamespace(width=100, height=100),

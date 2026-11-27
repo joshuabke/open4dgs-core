@@ -201,19 +201,30 @@ def test_depth_guide_crop_matches_are_offset_then_use_normal_geometry_gates(
     )
     monkeypatch.setattr(
         ROMA,
-        "triangulate_multiview_dlt",
-        lambda *_: np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
-    )
-    monkeypatch.setattr(ROMA, "within_scene_bounds", lambda *_: True)
-    monkeypatch.setattr(
-        ROMA,
-        "compute_reprojection_errors",
-        lambda _x, obs, _cams: (
-            np.zeros(len(obs), dtype=np.float64),
-            np.ones(len(obs), dtype=np.float64),
+        "triangulate_multiview_dlt_batch",
+        lambda _cam, _uv, counts, _cams: (
+            np.tile(np.asarray([0.0, 0.0, 5.0], dtype=np.float64), (len(counts), 1)),
+            np.ones(len(counts), dtype=bool),
         ),
     )
-    monkeypatch.setattr(ROMA, "compute_triangulation_angle_deg", lambda *_: 20.0)
+    monkeypatch.setattr(
+        ROMA,
+        "within_scene_bounds_batch",
+        lambda x, *_: np.ones(len(x), dtype=bool),
+    )
+    monkeypatch.setattr(
+        ROMA,
+        "compute_reprojection_errors_batch",
+        lambda _x, cam, _uv, _counts, _cams: (
+            np.zeros(len(cam), dtype=np.float64),
+            np.ones(len(cam), dtype=np.float64),
+        ),
+    )
+    monkeypatch.setattr(
+        ROMA,
+        "compute_triangulation_angle_deg_batch",
+        lambda _x, _cam, counts, _cams: np.full(len(counts), 20.0),
+    )
 
     cameras = [
         ROMA.Camera(
