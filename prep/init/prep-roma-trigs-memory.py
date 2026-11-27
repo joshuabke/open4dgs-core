@@ -1593,6 +1593,10 @@ def build_multiview_components(
     return list(components.values())
 
 
+def _is_float64_uv(uv: object) -> bool:
+    return isinstance(uv, np.ndarray) and uv.dtype == np.float64 and uv.shape == (2,)
+
+
 def average_observations_per_camera(
     component: Sequence[Observation],
 ) -> List[Observation]:
@@ -1601,6 +1605,20 @@ def average_observations_per_camera(
         grouped.setdefault(obs.cam_idx, []).append(obs)
     reduced: List[Observation] = []
     for cam_idx, obs_list in grouped.items():
+        o = obs_list[0]
+        if (
+            len(obs_list) == 1
+            and _is_float64_uv(o.uv)
+            and (o.uv_canon is None or _is_float64_uv(o.uv_canon))
+        ):
+            # The mean of a single float64 row is that row: skip stack + mean.
+            reduced.append(Observation(
+                cam_idx=cam_idx,
+                uv=o.uv.copy(),
+                uv_canon=None if o.uv_canon is None else o.uv_canon.copy(),
+                flow_px=float(o.flow_px),
+            ))
+            continue
         uv = np.mean(np.stack([o.uv for o in obs_list], axis=0), axis=0)
         any_canon = any(o.uv_canon is not None for o in obs_list)
         uv_canon = (
@@ -4474,54 +4492,70 @@ def track_points_to_next_keyframe(
             if device.startswith('cuda'):
                 torch.cuda.empty_cache()
 
-        for row_idx, ((p_idx, uv_a), uv_b, c) in enumerate(zip(queries, uvs_b, certs)):
-            if (
-                uv_b[0] < 0
-                or uv_b[0] > dense_w_b - 1
-                or uv_b[1] < 0
-                or uv_b[1] > dense_h_b - 1
-            ):
-                continue
-            uv_a64 = np.asarray(uv_a, dtype=np.float64)
-            uv_b64 = np.asarray(uv_b, dtype=np.float64)
-            obs_flow_pf = float(
-                np.linalg.norm(uv_b64 - uv_a64) / float(delta_nominal)
+        # All warped rows of this camera at once; the masks reproduce the
+        # per-row checks (bounds, certainty floor, cycle) in their order.
+        n_rows = min(len(queries), len(uvs_b), len(certs))
+        if n_rows == 0:
+            continue
+        uv_a64 = np.stack(
+            [np.asarray(q[1], dtype=np.float64) for q in queries[:n_rows]], axis=0
+        )
+        uv_b_raw = np.asarray(uvs_b)[:n_rows]
+        uv_b64 = uv_b_raw.astype(np.float64)
+        certs_arr = np.asarray(certs)[:n_rows]
+        inside = ~(
+            (uv_b_raw[:, 0] < 0)
+            | (uv_b_raw[:, 0] > dense_w_b - 1)
+            | (uv_b_raw[:, 1] < 0)
+            | (uv_b_raw[:, 1] > dense_h_b - 1)
+        )
+        obs_flow_pf = _row_norms(uv_b64 - uv_a64) / float(delta_nominal)
+        # Motion blur legitimately lowers warp certainty on fast pixels;
+        # let them in at a lower floor instead of losing the whole limb.
+        cert_floor = np.full((n_rows,), float(temporal_min_certainty), dtype=np.float64)
+        if float(temporal_min_certainty_fast) > 0.0:
+            cert_floor[obs_flow_pf >= float(temporal_fast_flow_px)] = min(
+                float(temporal_min_certainty), float(temporal_min_certainty_fast)
             )
-            # Motion blur legitimately lowers warp certainty on fast pixels;
-            # let them in at a lower floor instead of losing the whole limb.
-            cert_floor = float(temporal_min_certainty)
-            if (
-                float(temporal_min_certainty_fast) > 0.0
-                and obs_flow_pf >= float(temporal_fast_flow_px)
-            ):
-                cert_floor = min(cert_floor, float(temporal_min_certainty_fast))
-            if c < cert_floor:
-                stats['rej_low_certainty'] += 1
-                continue
-            if not cycle_ok[row_idx]:
-                stats['rej_cycle'] += 1
-                continue
-            uv_t_canon = uv_a64
-            uv_tnext_canon = uv_b64
+        if certs_arr.dtype.kind == 'f':
+            # A float32 certainty against a Python float compares in float32
+            # (NEP 50); cast the floor the same way.
+            cert_floor = cert_floor.astype(certs_arr.dtype)
+        low_cert = inside & (certs_arr < cert_floor)
+        cycle_bad = inside & ~low_cert & ~np.asarray(cycle_ok, dtype=bool)[:n_rows]
+        stats['rej_low_certainty'] += int(np.count_nonzero(low_cert))
+        stats['rej_cycle'] += int(np.count_nonzero(cycle_bad))
+        keep_rows = np.flatnonzero(inside & ~low_cert & ~cycle_bad)
 
-            if sync_motion_compensate and (
-                capture_residual_t is not None
-                or capture_residual_tnext is not None
-                or rs_coef != 0.0
-            ):
-                tau_a = float(rs_tau_frames(residual_t[cam_idx], rs_sign_c, rs_readout_frames,
-                                            uv_a64[rs_ax], rs_extent_c, rs_reference, rs_u_ref_c))
-                tau_b = float(rs_tau_frames(residual_tnext[cam_idx], rs_sign_c, rs_readout_frames,
-                                            uv_b64[rs_ax], rs_extent_c, rs_reference, rs_u_ref_c))
-                observed_interval = float(delta_signed) + tau_b - tau_a
-                if abs(observed_interval) > 1e-4:
-                    image_velocity = (uv_b64 - uv_a64) / observed_interval
-                    # Shift each asynchronous observation to the requested global times.
-                    uv_t_canon = uv_a64 - tau_a * image_velocity
-                    uv_tnext_canon = uv_b64 - tau_b * image_velocity
+        uv_t_canon = uv_a64
+        uv_tnext_canon = uv_b64
+        if len(keep_rows) and sync_motion_compensate and (
+            capture_residual_t is not None
+            or capture_residual_tnext is not None
+            or rs_coef != 0.0
+        ):
+            tau_a = rs_tau_frames(residual_t[cam_idx], rs_sign_c, rs_readout_frames,
+                                  uv_a64[:, rs_ax], rs_extent_c, rs_reference, rs_u_ref_c)
+            tau_b = rs_tau_frames(residual_tnext[cam_idx], rs_sign_c, rs_readout_frames,
+                                  uv_b64[:, rs_ax], rs_extent_c, rs_reference, rs_u_ref_c)
+            observed_interval = float(delta_signed) + tau_b - tau_a
+            shifted = np.abs(observed_interval) > 1e-4
+            with np.errstate(divide='ignore', invalid='ignore'):
+                image_velocity = (uv_b64 - uv_a64) / observed_interval[:, None]
+            # Shift each asynchronous observation to the requested global times.
+            uv_t_canon = np.where(
+                shifted[:, None], uv_a64 - tau_a[:, None] * image_velocity, uv_a64
+            )
+            uv_tnext_canon = np.where(
+                shifted[:, None], uv_b64 - tau_b[:, None] * image_velocity, uv_b64
+            )
 
-            warped_obs.setdefault(p_idx, {})[cam_idx] = (
-                uv_t_canon, uv_tnext_canon, uv_b64, float(c), obs_flow_pf
+        certs_list = certs_arr.tolist()
+        flow_list = obs_flow_pf.tolist()
+        for row_idx in keep_rows.tolist():
+            warped_obs.setdefault(queries[row_idx][0], {})[cam_idx] = (
+                uv_t_canon[row_idx], uv_tnext_canon[row_idx], uv_b64[row_idx],
+                float(certs_list[row_idx]), flow_list[row_idx],
             )
 
     tracked_X_t: List[np.ndarray] = []

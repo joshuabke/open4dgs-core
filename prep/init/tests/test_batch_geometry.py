@@ -275,3 +275,42 @@ def test_batch_geometry_matches_on_recorded_observations():
         )
         j += 1
     print(json.dumps({"points": int(len(counts)), "triangulated": int(ok.sum())}))
+
+
+def test_average_observations_single_view_shortcut_matches_mean():
+    rng = np.random.default_rng(9)
+
+    def reference(component):
+        grouped = {}
+        for obs in component:
+            grouped.setdefault(obs.cam_idx, []).append(obs)
+        out = []
+        for cam_idx, obs_list in grouped.items():
+            uv = np.mean(np.stack([o.uv for o in obs_list], axis=0), axis=0)
+            canon = None
+            if any(o.uv_canon is not None for o in obs_list):
+                canon = np.mean(np.stack([MODULE.observation_geom_uv(o) for o in obs_list]), axis=0)
+            out.append((cam_idx, uv, canon, float(np.mean([o.flow_px for o in obs_list]))))
+        return out
+
+    for _ in range(300):
+        component = []
+        for _ in range(int(rng.integers(1, 8))):
+            uv = rng.uniform(0, 2000, 2)
+            component.append(MODULE.Observation(
+                cam_idx=int(rng.integers(0, 5)),
+                uv=uv if rng.random() < 0.8 else uv.astype(np.float32),
+                uv_canon=None if rng.random() < 0.4 else uv + rng.normal(0, 2, 2),
+                flow_px=float(rng.uniform(0, 20)),
+            ))
+        got = MODULE.average_observations_per_camera(component)
+        want = reference(component)
+        assert len(got) == len(want)
+        for g, (cam_idx, uv, canon, flow) in zip(got, want):
+            assert g.cam_idx == cam_idx
+            assert g.uv.dtype == uv.dtype and np.array_equal(g.uv, uv)
+            assert (g.uv_canon is None) == (canon is None)
+            if canon is not None:
+                assert g.uv_canon.dtype == canon.dtype and np.array_equal(g.uv_canon, canon)
+            assert g.flow_px == flow
+            assert all(g.uv is not o.uv for o in component)
