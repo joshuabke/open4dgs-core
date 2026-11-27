@@ -1799,6 +1799,273 @@ def compute_reprojection_errors(
 
 
 # ---------------------------------------------------------------------------
+# Batched geometry over ragged observation lists
+#
+# A batch of M points stores its observations point-major and flat:
+# ``obs_cam [K]`` camera index, ``obs_uv [K, 2]`` pixel, and ``counts [M]``
+# observations per point (point i owns rows offsets[i]:offsets[i]+counts[i]).
+# Each batched function returns what the scalar function of the same name
+# returns for every point, up to floating-point rounding.
+# ---------------------------------------------------------------------------
+
+
+def _ragged_offsets(counts: np.ndarray) -> np.ndarray:
+    offsets = np.zeros(len(counts), dtype=np.int64)
+    if len(counts) > 1:
+        np.cumsum(counts[:-1], out=offsets[1:])
+    return offsets
+
+
+def _ragged_groups(counts: np.ndarray):
+    """Yield ``(n, point_idx [m], obs_idx [m, n])`` for each distinct count."""
+    counts = np.asarray(counts, dtype=np.int64)
+    offsets = _ragged_offsets(counts)
+    for n in np.unique(counts):
+        n = int(n)
+        points = np.flatnonzero(counts == n)
+        obs = offsets[points, None] + np.arange(n, dtype=np.int64)[None, :]
+        yield n, points, obs
+
+
+def _ragged_take(counts: np.ndarray, point_idx: np.ndarray) -> np.ndarray:
+    """Flat observation rows of the selected points, point-major."""
+    counts = np.asarray(counts, dtype=np.int64)
+    point_idx = np.asarray(point_idx, dtype=np.int64)
+    sub_counts = counts[point_idx]
+    total = int(sub_counts.sum())
+    if total == 0:
+        return np.zeros((0,), dtype=np.int64)
+    starts = _ragged_offsets(counts)[point_idx]
+    sub_offsets = _ragged_offsets(sub_counts)
+    return np.repeat(starts - sub_offsets, sub_counts) + np.arange(total, dtype=np.int64)
+
+
+def _ragged_mean(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """Per-point ``np.mean`` (rows reduce exactly like a 1-D ``np.mean``)."""
+    out = np.full((len(counts),), np.nan, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    for n, points, obs in _ragged_groups(counts):
+        if n > 0:
+            out[points] = values[obs].mean(axis=1)
+    return out
+
+
+def _ragged_max(values: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    out = np.full((len(counts),), np.nan, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    for n, points, obs in _ragged_groups(counts):
+        if n > 0:
+            out[points] = values[obs].max(axis=1)
+    return out
+
+
+def _ragged_any(mask: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    out = np.zeros((len(counts),), dtype=bool)
+    mask = np.asarray(mask, dtype=bool)
+    for n, points, obs in _ragged_groups(counts):
+        if n > 0:
+            out[points] = mask[obs].any(axis=1)
+    return out
+
+
+def _rotate_rows(R: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """``R @ x`` for every row x, bit-identical to the per-point product
+    (a plain ``X @ R.T`` takes a different BLAS path and rounds differently)."""
+    return np.matmul(R[None], X[:, :, None])[:, :, 0]
+
+
+def _row_norms(d: np.ndarray) -> np.ndarray:
+    """``np.linalg.norm`` of every row (same summation order, bit-identical)."""
+    return np.linalg.norm(d, axis=1)
+
+
+def _py_min(a, b) -> np.ndarray:
+    """Elementwise builtin ``min(a, b)``: ``b`` only where ``b < a`` (NaN-faithful)."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    return np.where(b < a, b, a)
+
+
+def _project_camera_points(cam: Camera, xcam: np.ndarray) -> np.ndarray:
+    """Distorted pixels of camera-frame points [N, 3]; raises cv2.error."""
+    obj = np.ascontiguousarray(xcam, dtype=np.float64).reshape(-1, 1, 3)
+    zero_rvec = np.zeros((3, 1), dtype=np.float64)
+    zero_tvec = np.zeros((3, 1), dtype=np.float64)
+    if cam.camera_model_name.upper() == 'OPENCV_FISHEYE':
+        uv, _ = cv2.fisheye.projectPoints(obj, zero_rvec, zero_tvec, cam._K, cam._D)
+    else:
+        uv, _ = cv2.projectPoints(obj, zero_rvec, zero_tvec, cam._K, cam._D)
+    return uv.reshape(-1, 2)
+
+
+def triangulate_multiview_dlt_batch(
+    obs_cam: np.ndarray,
+    obs_uv: np.ndarray,
+    counts: np.ndarray,
+    cameras: Sequence[Camera],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """``triangulate_multiview_dlt`` for M points at once.
+
+    Unprojects once per camera and solves every DLT system of the same size
+    with one stacked SVD. Returns ``X [M, 3]`` (NaN where it failed) and
+    ``ok [M]``, True exactly where the scalar function returns a point.
+    """
+    obs_cam = np.asarray(obs_cam, dtype=np.int64).reshape(-1)
+    obs_uv = np.asarray(obs_uv, dtype=np.float64).reshape(-1, 2)
+    counts = np.asarray(counts, dtype=np.int64).reshape(-1)
+    n_points = len(counts)
+    X = np.full((n_points, 3), np.nan, dtype=np.float64)
+    ok = np.zeros((n_points,), dtype=bool)
+    if n_points == 0 or len(obs_cam) == 0:
+        return X, ok
+
+    norm_uv = np.empty_like(obs_uv)
+    for cam_idx in np.unique(obs_cam):
+        sel = obs_cam == cam_idx
+        norm_uv[sel] = cameras[int(cam_idx)].unproject_image_points(obs_uv[sel])
+
+    used = np.unique(obs_cam)
+    P = np.zeros((int(used.max()) + 1, 3, 4), dtype=np.float64)
+    for cam_idx in used:
+        P[int(cam_idx)] = cameras[int(cam_idx)].extrinsic
+    P_obs = P[obs_cam]
+    rows = np.empty((len(obs_cam), 2, 4), dtype=np.float64)
+    rows[:, 0] = norm_uv[:, 0:1] * P_obs[:, 2] - P_obs[:, 0]
+    rows[:, 1] = norm_uv[:, 1:2] * P_obs[:, 2] - P_obs[:, 1]
+    rows_finite = np.isfinite(rows).all(axis=(1, 2))
+
+    for n, points, obs in _ragged_groups(counts):
+        if n < 2:
+            continue
+        finite = rows_finite[obs].all(axis=1)
+        for p_local in np.flatnonzero(~finite):
+            # LAPACK rejects non-finite systems; keep the scalar behaviour.
+            point_obs = [
+                Observation(cam_idx=int(obs_cam[k]), uv=obs_uv[k])
+                for k in obs[p_local]
+            ]
+            Xp = triangulate_multiview_dlt(point_obs, cameras)
+            if Xp is not None:
+                X[points[p_local]] = Xp
+                ok[points[p_local]] = True
+        if not finite.any():
+            continue
+        good = points[finite]
+        A = rows[obs[finite]].reshape(len(good), 2 * n, 4)
+        _, _, vt = np.linalg.svd(A, full_matrices=False)
+        Xh = vt[:, -1, :]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            Xg = Xh[:, :3] / Xh[:, 3:4]
+        good_ok = ~(np.abs(Xh[:, 3]) < 1e-12) & np.isfinite(Xg).all(axis=1)
+        X[good[good_ok]] = Xg[good_ok]
+        ok[good[good_ok]] = True
+    return X, ok
+
+
+def compute_reprojection_errors_batch(
+    X: np.ndarray,
+    obs_cam: np.ndarray,
+    obs_uv: np.ndarray,
+    counts: np.ndarray,
+    cameras: Sequence[Camera],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """``compute_reprojection_errors`` for M points: flat ``errors [K]`` and
+    ``depths [K]`` in observation order (inf where the point does not project)."""
+    obs_cam = np.asarray(obs_cam, dtype=np.int64).reshape(-1)
+    obs_uv = np.asarray(obs_uv, dtype=np.float64).reshape(-1, 2)
+    counts = np.asarray(counts, dtype=np.int64).reshape(-1)
+    n_obs = len(obs_cam)
+    errors = np.full((n_obs,), np.inf, dtype=np.float64)
+    depths = np.empty((n_obs,), dtype=np.float64)
+    if n_obs == 0:
+        return errors, depths
+    X_obs = np.repeat(np.asarray(X, dtype=np.float64).reshape(-1, 3), counts, axis=0)
+    for cam_idx in np.unique(obs_cam):
+        cam = cameras[int(cam_idx)]
+        rows = np.flatnonzero(obs_cam == cam_idx)
+        xcam = _rotate_rows(cam.R, X_obs[rows]) + cam.t
+        depths[rows] = xcam[:, 2]
+        front = xcam[:, 2] > 1e-9
+        rows_front = rows[front]
+        if len(rows_front) == 0:
+            continue
+        try:
+            projected = _project_camera_points(cam, xcam[front])
+        except cv2.error:
+            for k in rows_front:
+                uv = cam.project_world_point(X_obs[k])
+                if uv is not None:
+                    errors[k] = float(np.linalg.norm(uv - obs_uv[k]))
+            continue
+        finite = np.isfinite(projected).all(axis=1)
+        errors[rows_front[finite]] = _row_norms(
+            projected[finite] - obs_uv[rows_front[finite]]
+        )
+    return errors, depths
+
+
+def compute_triangulation_angle_deg_batch(
+    X: np.ndarray,
+    obs_cam: np.ndarray,
+    counts: np.ndarray,
+    cameras: Sequence[Camera],
+) -> np.ndarray:
+    """``compute_triangulation_angle_deg`` for M points: ``angles [M]``."""
+    obs_cam = np.asarray(obs_cam, dtype=np.int64).reshape(-1)
+    counts = np.asarray(counts, dtype=np.int64).reshape(-1)
+    angles = np.zeros((len(counts),), dtype=np.float64)
+    if len(obs_cam) == 0:
+        return angles
+    used = np.unique(obs_cam)
+    centers = np.zeros((int(used.max()) + 1, 3), dtype=np.float64)
+    for cam_idx in used:
+        centers[int(cam_idx)] = cameras[int(cam_idx)].center_world
+    X_obs = np.repeat(np.asarray(X, dtype=np.float64).reshape(-1, 3), counts, axis=0)
+    d = X_obs - centers[obs_cam]
+    norms = _row_norms(d)
+    ray_ok = ~(norms < 1e-9)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rays = d / norms[:, None]
+    for n, points, obs in _ragged_groups(counts):
+        if n < 2:
+            continue
+        valid = ray_ok[obs]                      # [m, n]
+        enough = valid.sum(axis=1) >= 2
+        if not enough.any():
+            continue
+        r = np.where(valid[:, :, None], rays[obs], 0.0)[enough]
+        v = valid[enough]
+        cos = np.clip(np.matmul(r, r.transpose(0, 2, 1)), -1.0, 1.0)
+        # Skipped rays and the diagonal never lower the minimum.
+        cos[~(v[:, :, None] & v[:, None, :])] = 1.0
+        idx = np.arange(n)
+        cos[:, idx, idx] = 1.0
+        min_cos = cos.reshape(len(r), -1).min(axis=1)
+        angles[points[enough]] = np.degrees(np.arccos(min_cos))
+    return angles
+
+
+def within_scene_bounds_batch(
+    X: np.ndarray,
+    scene_meta: Optional[Dict[str, object]],
+    scene_radius_mult: float,
+) -> np.ndarray:
+    """``within_scene_bounds`` for points [M, 3]."""
+    X = np.asarray(X, dtype=np.float64).reshape(-1, 3)
+    if scene_meta is None:
+        return np.ones((len(X),), dtype=bool)
+    center = np.asarray(
+        scene_meta.get('scene_center', [0.0, 0.0, 0.0]), dtype=np.float64
+    )
+    radius = float(
+        scene_meta.get('scene_radius_p95', scene_meta.get('scene_radius_max', 0.0))
+    )
+    if radius <= 0:
+        return np.ones((len(X),), dtype=bool)
+    return _row_norms(X - center[None, :]) <= float(scene_radius_mult * radius)
+
+
+# ---------------------------------------------------------------------------
 # Vectorised bilinear colour sampling
 # ---------------------------------------------------------------------------
 
@@ -3683,6 +3950,11 @@ def reconstruct_frame_cloud(
     support_hist: Dict[str, int] = {}
     accepted_support_hist: Dict[str, int] = {}
 
+    cand_obs: List[List[Observation]] = []
+    cand_audit: List[int] = []
+    cand_cam: List[int] = []
+    cand_uv: List[np.ndarray] = []
+    cand_flow: List[float] = []
     for component_id, comp in enumerate(components):
         obs = average_observations_per_camera(comp)
         n_obs = len(obs)
@@ -3713,22 +3985,74 @@ def reconstruct_frame_cloud(
             rej_min_views += 1
             continue
 
-        # Geometry runs on sync-compensated pixels; color/mask/tracking keep raw.
-        geom_obs = [
-            Observation(cam_idx=o.cam_idx, uv=observation_geom_uv(o))
-            for o in obs
+        cand_obs.append(obs)
+        cand_audit.append(audit_record_idx)
+        for o in obs:
+            cand_cam.append(int(o.cam_idx))
+            # Geometry runs on sync-compensated pixels; color/mask/tracking keep raw.
+            cand_uv.append(observation_geom_uv(o))
+            cand_flow.append(float(o.flow_px))
+
+    # Geometry for every surviving component at once; the gates below apply
+    # it in the same order as the per-point checks they replace.
+    cand_counts = np.fromiter(
+        (len(o) for o in cand_obs), dtype=np.int64, count=len(cand_obs)
+    )
+    cand_cam_arr = np.asarray(cand_cam, dtype=np.int64)
+    cand_uv_arr = np.asarray(cand_uv, dtype=np.float64).reshape(-1, 2)
+    mean_flow = _ragged_mean(np.asarray(cand_flow, dtype=np.float64), cand_counts)
+    cand_reproj_allowed = reproj_thresh_px + _py_min(
+        float(motion_slack) * mean_flow, float(motion_slack_max_px)
+    )
+    cand_X, cand_tri_ok = triangulate_multiview_dlt_batch(
+        cand_cam_arr, cand_uv_arr, cand_counts, cameras
+    )
+    cand_in_bounds = np.zeros((len(cand_obs),), dtype=bool)
+    cand_in_bounds[cand_tri_ok] = within_scene_bounds_batch(
+        cand_X[cand_tri_ok], scene_meta, scene_radius_mult
+    )
+    alive = np.flatnonzero(cand_tri_ok & cand_in_bounds)
+    alive_rows = _ragged_take(cand_counts, alive)
+    reproj_flat, depths_flat = compute_reprojection_errors_batch(
+        cand_X[alive], cand_cam_arr[alive_rows], cand_uv_arr[alive_rows],
+        cand_counts[alive], cameras,
+    )
+    cand_mean_reproj = np.full((len(cand_obs),), np.nan, dtype=np.float64)
+    cand_max_reproj = np.full((len(cand_obs),), np.nan, dtype=np.float64)
+    cand_neg_depth = np.zeros((len(cand_obs),), dtype=bool)
+    cand_mean_reproj[alive] = _ragged_mean(reproj_flat, cand_counts[alive])
+    cand_max_reproj[alive] = _ragged_max(reproj_flat, cand_counts[alive])
+    cand_neg_depth[alive] = _ragged_any(depths_flat <= 0, cand_counts[alive])
+    cand_angle = np.zeros((len(cand_obs),), dtype=np.float64)
+    if min_triangulation_angle_deg > 0.0:
+        angle_idx = alive[
+            ~cand_neg_depth[alive]
+            & ~(cand_mean_reproj[alive] > cand_reproj_allowed[alive])
         ]
-        mean_flow = float(np.mean([o.flow_px for o in obs]))
-        reproj_allowed = reproj_thresh_px + min(
-            float(motion_slack) * mean_flow, float(motion_slack_max_px)
+        angle_rows = _ragged_take(cand_counts, angle_idx)
+        cand_angle[angle_idx] = compute_triangulation_angle_deg_batch(
+            cand_X[angle_idx], cand_cam_arr[angle_rows],
+            cand_counts[angle_idx], cameras,
         )
 
-        X = triangulate_multiview_dlt(geom_obs, cameras)
-        if X is None:
+    tri_ok_list = cand_tri_ok.tolist()
+    in_bounds_list = cand_in_bounds.tolist()
+    neg_depth_list = cand_neg_depth.tolist()
+    mean_reproj_list = cand_mean_reproj.tolist()
+    max_reproj_list = cand_max_reproj.tolist()
+    allowed_list = cand_reproj_allowed.tolist()
+    angle_list = cand_angle.tolist()
+    for cand_idx, obs in enumerate(cand_obs):
+        audit_record_idx = cand_audit[cand_idx]
+        n_obs = len(obs)
+        reproj_allowed = allowed_list[cand_idx]
+
+        if not tri_ok_list[cand_idx]:
             if audit_record_idx >= 0:
                 audit_records[audit_record_idx]['status'] = 'triangulation_failed'
             rej_triang += 1
             continue
+        X = cand_X[cand_idx]
 
         if audit_record_idx >= 0:
             audit_records[audit_record_idx]['position'] = (
@@ -3738,33 +4062,32 @@ def reconstruct_frame_cloud(
                 reproj_allowed
             )
 
-        if not within_scene_bounds(X, scene_meta, scene_radius_mult):
+        if not in_bounds_list[cand_idx]:
             if audit_record_idx >= 0:
                 audit_records[audit_record_idx]['status'] = 'outside_bounds'
             rej_bounds += 1
             continue
 
-        reproj, depths = compute_reprojection_errors(X, geom_obs, cameras)
         if audit_record_idx >= 0:
             audit_records[audit_record_idx]['mean_reprojection_px'] = float(
-                np.mean(reproj)
+                mean_reproj_list[cand_idx]
             )
             audit_records[audit_record_idx]['max_reprojection_px'] = float(
-                np.max(reproj)
+                max_reproj_list[cand_idx]
             )
-        if np.any(depths <= 0):
+        if neg_depth_list[cand_idx]:
             if audit_record_idx >= 0:
                 audit_records[audit_record_idx]['status'] = 'negative_depth'
             rej_depth += 1
             continue
-        if float(np.mean(reproj)) > reproj_allowed:
+        if mean_reproj_list[cand_idx] > reproj_allowed:
             if audit_record_idx >= 0:
                 audit_records[audit_record_idx]['status'] = 'reprojection'
             rej_reproj += 1
             continue
 
         if min_triangulation_angle_deg > 0.0:
-            ang = compute_triangulation_angle_deg(X, geom_obs, cameras)
+            ang = angle_list[cand_idx]
             if audit_record_idx >= 0:
                 audit_records[audit_record_idx]['triangulation_angle_deg'] = float(ang)
             if ang < min_triangulation_angle_deg:
@@ -4207,6 +4530,17 @@ def track_points_to_next_keyframe(
     tracked_obs_uv_tnext: List[Dict[int, np.ndarray]] = []
     tracked_support_counts: List[int] = []
 
+    # Gate each point on its warped views, then triangulate and validate all
+    # candidates at once with the same gates and counters as the per-point
+    # checks this replaces. Both endpoints use the identical camera subset.
+    # When sync offsets are supplied, observations have already been shifted
+    # to common global times using the measured image displacement.
+    cand_src: List[int] = []
+    cand_maps: List[Dict[int, Tuple]] = []
+    cand_cam: List[int] = []
+    cand_uv_t: List[np.ndarray] = []
+    cand_uv_tnext: List[np.ndarray] = []
+    cand_flow: List[float] = []
     for p_idx in range(len(cloud_t.positions)):
         obs_map = warped_obs.get(p_idx, {})
         if len(obs_map) == 0:
@@ -4215,62 +4549,80 @@ def track_points_to_next_keyframe(
         if len(obs_map) < min_tracked_views:
             stats['rej_min_views'] += 1
             continue
+        cand_src.append(int(p_idx))
+        cand_maps.append(obs_map)
+        for c, values in obs_map.items():
+            cand_cam.append(int(c))
+            cand_uv_t.append(values[0])
+            cand_uv_tnext.append(values[1])
+            cand_flow.append(values[4])
 
-        # Triangulate both endpoints from the identical camera subset. When
-        # sync offsets are supplied, observations have already been shifted to
-        # common global times using the measured image displacement.
-        obs_t_sym = [
-            Observation(cam_idx=int(c), uv=np.asarray(values[0], dtype=np.float64))
-            for c, values in obs_map.items()
-        ]
-        obs_tnext = [
-            Observation(cam_idx=int(c), uv=np.asarray(values[1], dtype=np.float64))
-            for c, values in obs_map.items()
-        ]
-        X_t_sym = triangulate_multiview_dlt(obs_t_sym, cameras)
-        if X_t_sym is None:
-            stats['rej_triangulation'] += 1
-            continue
-        X_tnext = triangulate_multiview_dlt(obs_tnext, cameras)
-        if X_tnext is None:
-            stats['rej_triangulation'] += 1
-            continue
+    cand_counts = np.fromiter(
+        (len(m) for m in cand_maps), dtype=np.int64, count=len(cand_maps)
+    )
+    cand_cam_arr = np.asarray(cand_cam, dtype=np.int64)
+    cand_uv_t_arr = np.asarray(cand_uv_t, dtype=np.float64).reshape(-1, 2)
+    cand_uv_tnext_arr = np.asarray(cand_uv_tnext, dtype=np.float64).reshape(-1, 2)
+    X_t_all, ok_t = triangulate_multiview_dlt_batch(
+        cand_cam_arr, cand_uv_t_arr, cand_counts, cameras
+    )
+    X_tnext_all, ok_tnext = triangulate_multiview_dlt_batch(
+        cand_cam_arr, cand_uv_tnext_arr, cand_counts, cameras
+    )
+    tri_ok = ok_t & ok_tnext
+    stats['rej_triangulation'] += int(np.count_nonzero(~tri_ok))
 
-        if not within_scene_bounds(X_t_sym, scene_meta, scene_radius_mult) or not within_scene_bounds(X_tnext, scene_meta, scene_radius_mult):
-            stats['rej_bounds'] += 1
-            continue
+    in_bounds = np.zeros((len(cand_maps),), dtype=bool)
+    in_bounds[tri_ok] = (
+        within_scene_bounds_batch(X_t_all[tri_ok], scene_meta, scene_radius_mult)
+        & within_scene_bounds_batch(X_tnext_all[tri_ok], scene_meta, scene_radius_mult)
+    )
+    stats['rej_bounds'] += int(np.count_nonzero(tri_ok & ~in_bounds))
+    alive = np.flatnonzero(tri_ok & in_bounds)
 
-        # Widen the reprojection gate proportionally to local image motion so
-        # blur-noisy fast points survive; static points keep the strict gate.
-        mean_flow_pf = float(np.mean([values[4] for values in obs_map.values()]))
-        reproj_allowed = temporal_reproj_thresh_px + min(
-            float(motion_slack) * mean_flow_pf, float(motion_slack_max_px)
+    # Widen the reprojection gate proportionally to local image motion so
+    # blur-noisy fast points survive; static points keep the strict gate.
+    mean_flow_pf = _ragged_mean(np.asarray(cand_flow, dtype=np.float64), cand_counts)
+    reproj_allowed = temporal_reproj_thresh_px + _py_min(
+        float(motion_slack) * mean_flow_pf, float(motion_slack_max_px)
+    )
+    rows = _ragged_take(cand_counts, alive)
+    sub_counts = cand_counts[alive]
+    reproj_t, depths_t = compute_reprojection_errors_batch(
+        X_t_all[alive], cand_cam_arr[rows], cand_uv_t_arr[rows], sub_counts, cameras
+    )
+    reproj, depths = compute_reprojection_errors_batch(
+        X_tnext_all[alive], cand_cam_arr[rows], cand_uv_tnext_arr[rows], sub_counts, cameras
+    )
+    allowed_alive = reproj_allowed[alive]
+    reproj_ok = ~(
+        _ragged_any(depths_t <= 0, sub_counts)
+        | (_ragged_mean(reproj_t, sub_counts) > allowed_alive)
+        | _ragged_any(depths <= 0, sub_counts)
+        | (_ragged_mean(reproj, sub_counts) > allowed_alive)
+    )
+    stats['rej_reprojection'] += int(np.count_nonzero(~reproj_ok))
+    alive = alive[reproj_ok]
+
+    if min_triangulation_angle_deg > 0.0:
+        rows = _ragged_take(cand_counts, alive)
+        sub_counts = cand_counts[alive]
+        ang_t = compute_triangulation_angle_deg_batch(
+            X_t_all[alive], cand_cam_arr[rows], sub_counts, cameras
         )
+        ang_tnext = compute_triangulation_angle_deg_batch(
+            X_tnext_all[alive], cand_cam_arr[rows], sub_counts, cameras
+        )
+        angle_ok = ~(_py_min(ang_t, ang_tnext) < min_triangulation_angle_deg)
+        stats['rej_angle'] += int(np.count_nonzero(~angle_ok))
+        alive = alive[angle_ok]
 
-        reproj_t, depths_t = compute_reprojection_errors(X_t_sym, obs_t_sym, cameras)
-        if np.any(depths_t <= 0) or float(np.mean(reproj_t)) > reproj_allowed:
-            stats['rej_reprojection'] += 1
-            continue
-
-        reproj, depths = compute_reprojection_errors(X_tnext, obs_tnext, cameras)
-        if np.any(depths <= 0):
-            stats['rej_reprojection'] += 1
-            continue
-        if float(np.mean(reproj)) > reproj_allowed:
-            stats['rej_reprojection'] += 1
-            continue
-
-        if min_triangulation_angle_deg > 0.0:
-            ang_t = compute_triangulation_angle_deg(X_t_sym, obs_t_sym, cameras)
-            ang_tnext = compute_triangulation_angle_deg(X_tnext, obs_tnext, cameras)
-            if min(ang_t, ang_tnext) < min_triangulation_angle_deg:
-                stats['rej_angle'] += 1
-                continue
-
-        # The mask vote runs as one batched call after this loop.
-        tracked_X_t.append(X_t_sym.astype(np.float32))
-        tracked_X_tnext.append(X_tnext.astype(np.float32))
-        tracked_src_indices.append(int(p_idx))
+    # The mask vote runs as one batched call after this loop.
+    tracked_X_t.extend(X_t_all[alive].astype(np.float32))
+    tracked_X_tnext.extend(X_tnext_all[alive].astype(np.float32))
+    for cand_idx in alive.tolist():
+        obs_map = cand_maps[cand_idx]
+        tracked_src_indices.append(cand_src[cand_idx])
         tracked_obs_uv_tnext.append({c: values[2] for c, values in obs_map.items()})
         tracked_support_counts.append(int(len(obs_map)))
         stats['accepted'] += 1
