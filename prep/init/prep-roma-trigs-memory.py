@@ -78,7 +78,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -93,6 +93,7 @@ from rigid_motion import (
 )
 from motion_budget import MotionBudgetParams, keyframe_spacing, motion_budget_select, neighbourhood_speed
 from roma_backends import (
+    MEMFOF_DEFAULT_BATCH_SIZE,
     MEMFOF_DEFAULT_CHECKPOINT,
     DenseMatch,
     MemfofTemporalBackend,
@@ -450,6 +451,7 @@ def build_run_fingerprint(args: argparse.Namespace) -> Tuple[str, Dict[str, obje
         "force_run_fingerprint",
         "trust_cache",
         "keep_cache",
+        "memfof_batch_size",
     }
     # --rigid-* and --motion-budget-* only change finalize-time post-passes,
     # never a per-frame checkpoint, so tuning them must not invalidate the cache.
@@ -5253,6 +5255,16 @@ def parse_args() -> argparse.Namespace:
             'one, and keeps the hop flows of one keyframe in memory (~2 GB for 27 cameras at 1080p).'
         ),
     )
+    p.add_argument(
+        '--memfof-batch-size',
+        type=int,
+        default=MEMFOF_DEFAULT_BATCH_SIZE,
+        help=(
+            'MEMFOF triplets per GPU inference (all cameras and hop frames of a keyframe are '
+            'batched). On CUDA out-of-memory the batch is halved and retried, down to 1. '
+            'Only changes speed and VRAM, not the result beyond float rounding.'
+        ),
+    )
     p.add_argument('--memfof-max-side', type=int, default=1920,
                    help='Images are resized so the long side is at most this for '
                         'MEMFOF (trained for 1080p); flows are rescaled to full resolution.')
@@ -7134,6 +7146,92 @@ def _append_assembled_frame(
 
     return velocity_units
 
+
+HopKey = Tuple[int, int, int, int]   # (camera, source frame of t-1, of t, of t+1)
+
+
+def memfof_hop_triplets(
+    frame_idx: int,
+    frame_delta: int,
+    *,
+    backward: bool,
+    camera_frames: Callable[[int], np.ndarray],
+    n_cams: int,
+) -> Tuple[List[int], List[int], Dict[Tuple[int, int], HopKey]]:
+    """The one-frame hop triplets of the composed MEMFOF warps of keyframe ``frame_idx``.
+
+    Forward hops use centres t .. t+d-1, backward hops t .. t-d+1 (only with ``backward``).
+    Hop c -> c+-1 uses the MEMFOF triplet (c-1, c, c+1); ``camera_frames(g)`` maps a global
+    frame to each camera's source frame (sync-aware, clipped to the input range). Returns the
+    forward and backward centres and, per (camera, centre), the triplet's key: the camera and
+    the three source frames it reads, so equal keys mean equal inputs and equal flows.
+    """
+    d = abs(int(frame_delta))
+    centres_f = list(range(int(frame_idx), int(frame_idx) + d))
+    centres_b = list(range(int(frame_idx), int(frame_idx) - d, -1)) if backward else []
+    centres = sorted(set(centres_f) | set(centres_b))
+    if not centres:
+        return centres_f, centres_b, {}
+    frames = {g: np.asarray(camera_frames(g)) for g in range(centres[0] - 1, centres[-1] + 2)}
+    keys = {
+        (cam, c): (cam, int(frames[c - 1][cam]), int(frames[c][cam]), int(frames[c + 1][cam]))
+        for cam in range(int(n_cams))
+        for c in centres
+    }
+    return centres_f, centres_b, keys
+
+
+def memfof_composed_warps(
+    temporal_model,
+    *,
+    frame_idx: int,
+    frame_delta: int,
+    backward: bool,
+    camera_frames: Callable[[int], np.ndarray],
+    image_sizes: Sequence[Tuple[int, int]],
+    fetch: Callable[[Tuple[int, int]], np.ndarray],
+    cache: Dict[HopKey, Tuple[np.ndarray, np.ndarray, float]],
+) -> Tuple[List[DenseMatch], List[Optional[DenseMatch]]]:
+    """Composed forward (and backward) one-frame hop warps per camera (--memfof-compose-hops).
+
+    ``fetch((camera, source_frame))`` returns an image. ``cache`` maps hop keys to MEMFOF
+    flows and is updated in place: entries this keyframe does not use are dropped, the
+    missing triplets of all cameras are computed in one batched call, and the triplets this
+    keyframe shares with the previous one (its backward hops overlap that one's forward hops)
+    are taken from the cache. The direct (t-d, t, t+d) flow is not computed: sampling and
+    layout validation of a composed warp only read its hops.
+    """
+    n_cams = len(image_sizes)
+    centres_f, centres_b, keys = memfof_hop_triplets(
+        frame_idx, frame_delta, backward=backward, camera_frames=camera_frames, n_cams=n_cams,
+    )
+    wanted = set(keys.values())
+    for key in [k for k in cache if k not in wanted]:
+        del cache[key]
+    missing = list(dict.fromkeys(k for k in keys.values() if k not in cache))   # camera-major
+    if missing:
+        flows = temporal_model.triplet_flows_batch(
+            [((k[0], k[1]), (k[0], k[2]), (k[0], k[3])) for k in missing], fetch,
+        )
+        cache.update(zip(missing, flows))
+    fwd_warps: List[DenseMatch] = []
+    bwd_warps: List[Optional[DenseMatch]] = []
+    for cam in range(n_cams):
+        h_img, w_img = image_sizes[cam]
+        hops_f = [(cache[keys[(cam, c)]][1], cache[keys[(cam, c)]][2]) for c in centres_f]
+        fwd_warps.append(MemfofTemporalBackend.make_composed_dense(
+            None, hops_f[0][1], h_img, w_img, hops_f,
+        ))
+        if backward:
+            hops_b = [(cache[keys[(cam, c)]][0], cache[keys[(cam, c)]][2]) for c in centres_b]
+            bwd_warps.append(MemfofTemporalBackend.make_composed_dense(
+                None, hops_b[0][1], h_img, w_img, hops_b,
+            ))
+        else:
+            bwd_warps.append(None)
+    return fwd_warps, bwd_warps
+
+
 def main() -> None:
     args = parse_args()
 
@@ -7378,6 +7476,7 @@ def main() -> None:
             device=args.device,
             checkpoint=args.memfof_checkpoint,
             max_side=int(args.memfof_max_side),
+            batch_size=int(args.memfof_batch_size),
         )
         print(
             f'Temporal backend: {temporal_model.name} (max side {int(args.memfof_max_side)} px)'
@@ -7818,6 +7917,18 @@ def main() -> None:
         )
         return planned
 
+    def hop_camera_frames(g: int) -> np.ndarray:
+        """Each camera's source frame for global frame ``g`` (as build_fresh picks them)."""
+        if sync_enabled:
+            return sync_aware_camera_frames(
+                g, fps=args.fps, offsets_sec=sync_offsets_sec,
+                frame_start=input_frame_start, frame_end=input_frame_end,
+            )
+        return np.full((len(cameras),), int(np.clip(g, input_frame_start, input_frame_end)), dtype=np.int64)
+
+    # MEMFOF hop flows shared between consecutive work items (see memfof_composed_warps).
+    hop_flow_cache: Dict[HopKey, Tuple[np.ndarray, np.ndarray, float]] = {}
+
     assembled_keyframes: List[int] = []
     # Offset solving needs the full per-keyframe observation graphs after the
     # main loop.  They are large (nested per-point/per-camera arrays), so do
@@ -7982,73 +8093,74 @@ def main() -> None:
                 if do_backward:
                     back_loaded = build_fresh(back_frame, reconstruct=False)
                 images_prev = back_loaded[1] if back_loaded is not None else images_t
-                fwd_warps, bwd_warps = [], []
-                for cam_idx in range(len(cameras)):
-                    bwd_flow, fwd_flow, flow_scale = temporal_model.triplet_flows(
-                        images_prev[cam_idx], images_t[cam_idx], images_n[cam_idx]
-                    )
-                    h_img, w_img = images_t[cam_idx].shape[:2]
-                    fwd_warps.append(MemfofTemporalBackend.make_dense(fwd_flow, flow_scale, h_img, w_img))
-                    bwd_warps.append(
-                        MemfofTemporalBackend.make_dense(bwd_flow, flow_scale, h_img, w_img)
-                        if back_loaded is not None else None
-                    )
+                image_sizes = [tuple(im.shape[:2]) for im in images_t]
                 if args.memfof_compose_hops:
                     # Replace each warp's sampling by delta one-frame hops: hop c -> c+-1 uses the
                     # forward/backward flow of triplet (c-1, c, c+1). Frames are chosen per camera
-                    # with the same sync-aware rule as the keyframe images; the direct flows above
-                    # stay in the payload for layout validation only.
-                    d_hop = abs(int(frame_delta))
-                    # Forward hops read frames t-1 .. t+d (the first hop's triplet is (t-1, t, t+1)),
-                    # backward hops t-d .. t+1. Frames outside the input range are clipped, as the
-                    # sync-aware selection does, so at the sequence start t stands in for t-1.
-                    lo_g = frame_idx - d_hop if back_loaded is not None else frame_idx - 1
-                    hop_frames = {
-                        g: (
-                            sync_aware_camera_frames(
-                                g, fps=args.fps, offsets_sec=sync_offsets_sec,
-                                frame_start=input_frame_start, frame_end=input_frame_end,
-                            )
-                            if sync_enabled
-                            else np.full(
-                                (len(cameras),), int(np.clip(g, input_frame_start, input_frame_end)), dtype=np.int64
-                            )
-                        )
-                        for g in range(lo_g, frame_idx + d_hop + 1)
-                    }
-                    centres_f = list(range(frame_idx, frame_idx + d_hop))
-                    centres_b = (
-                        list(range(frame_idx, frame_idx - d_hop, -1)) if back_loaded is not None else []
+                    # with the same sync-aware rule as the keyframe images. Forward hops read
+                    # frames t-1 .. t+d (the first hop's triplet is (t-1, t, t+1)), backward hops
+                    # t-d .. t+1. Frames outside the input range are clipped, as the sync-aware
+                    # selection does, so at the sequence start t stands in for t-1.
+                    known: Dict[Tuple[int, int], np.ndarray] = {}
+                    for loaded_frame, loaded_images in (
+                        (frame_idx, images_t),
+                        (frame_idx + abs(int(frame_delta)), images_n),
+                        (frame_idx - abs(int(frame_delta)), images_prev if back_loaded is not None else None),
+                    ):
+                        if loaded_images is None:
+                            continue
+                        for cam_idx, cam_frame in enumerate(hop_camera_frames(loaded_frame)):
+                            known[(cam_idx, int(cam_frame))] = loaded_images[cam_idx]
+
+                    def hop_image(key: Tuple[int, int]) -> np.ndarray:
+                        if key in known:
+                            return known[key]
+                        path_g = image_path(images_root, cameras[key[0]], key[1], args.image_pattern)
+                        return np.asarray(Image.open(path_g).convert('RGB'), dtype=np.uint8)
+
+                    fwd_warps, bwd_warps = memfof_composed_warps(
+                        temporal_model,
+                        frame_idx=frame_idx,
+                        frame_delta=frame_delta,
+                        backward=back_loaded is not None,
+                        camera_frames=hop_camera_frames,
+                        image_sizes=image_sizes,
+                        fetch=hop_image,
+                        cache=hop_flow_cache,
                     )
-                    for cam_idx in range(len(cameras)):
-                        known = {frame_idx: images_t[cam_idx], frame_idx + d_hop: images_n[cam_idx]}
-                        if back_loaded is not None:
-                            known[frame_idx - d_hop] = images_prev[cam_idx]
-
-                        def hop_image(g: int) -> np.ndarray:
-                            if g not in known:
-                                path_g = image_path(
-                                    images_root, cameras[cam_idx], int(hop_frames[g][cam_idx]),
-                                    args.image_pattern,
-                                )
-                                known[g] = np.asarray(Image.open(path_g).convert('RGB'), dtype=np.uint8)
-                            return known[g]
-
-                        hop_flows = {
-                            c: temporal_model.triplet_flows(hop_image(c - 1), hop_image(c), hop_image(c + 1))
-                            for c in sorted(set(centres_f) | set(centres_b))
-                        }
-                        h_img, w_img = images_t[cam_idx].shape[:2]
-                        fwd_warps[cam_idx] = MemfofTemporalBackend.make_composed_dense(
-                            fwd_warps[cam_idx].payload["flow"], fwd_warps[cam_idx].payload["scale"],
-                            h_img, w_img, [(hop_flows[c][1], hop_flows[c][2]) for c in centres_f],
+                    del known
+                    # Keep only the triplets the next work item reuses.
+                    if work_pos < len(work_items):
+                        nxt = int(work_items[work_pos][1])
+                        nxt_delta = SUBKEYFRAME_TRACK_DELTA if work_pos >= n_keyframe_items else temporal_frame_delta
+                        nxt_back = (
+                            bool(getattr(args, 'centred_velocity', False))
+                            and int(nxt - nxt_delta) >= int(input_frame_start)
                         )
-                        if back_loaded is not None:
-                            bwd_warps[cam_idx] = MemfofTemporalBackend.make_composed_dense(
-                                bwd_warps[cam_idx].payload["flow"], bwd_warps[cam_idx].payload["scale"],
-                                h_img, w_img, [(hop_flows[c][0], hop_flows[c][2]) for c in centres_b],
-                            )
-                        del known, hop_flows
+                        _, _, nxt_keys = memfof_hop_triplets(
+                            nxt, nxt_delta, backward=nxt_back,
+                            camera_frames=hop_camera_frames, n_cams=len(cameras),
+                        )
+                        reuse = set(nxt_keys.values())
+                        for key in [k for k in hop_flow_cache if k not in reuse]:
+                            del hop_flow_cache[key]
+                    else:
+                        hop_flow_cache.clear()
+                else:
+                    images_by_role = (images_prev, images_t, images_n)
+                    flows = temporal_model.triplet_flows_batch(
+                        [((0, c), (1, c), (2, c)) for c in range(len(cameras))],
+                        lambda key: images_by_role[key[0]][key[1]],
+                    )
+                    fwd_warps, bwd_warps = [], []
+                    for cam_idx, (bwd_flow, fwd_flow, flow_scale) in enumerate(flows):
+                        h_img, w_img = image_sizes[cam_idx]
+                        fwd_warps.append(MemfofTemporalBackend.make_dense(fwd_flow, flow_scale, h_img, w_img))
+                        bwd_warps.append(
+                            MemfofTemporalBackend.make_dense(bwd_flow, flow_scale, h_img, w_img)
+                            if back_loaded is not None else None
+                        )
+                    del flows, images_by_role
                 del images_prev
                 _log_mem(args.log_memory, f'after memfof flows {frame_idx}')
 

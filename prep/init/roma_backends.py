@@ -14,7 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Hashable, Optional, Protocol, Sequence
 
 import cv2
 import numpy as np
@@ -728,6 +729,7 @@ class RoMaV2Backend:
 
 
 MEMFOF_DEFAULT_CHECKPOINT = "egorchistov/optical-flow-MEMFOF-Tartan-T-TSKH"
+MEMFOF_DEFAULT_BATCH_SIZE = 4   # triplets per inference; ~?? GB each at 1080p
 
 
 COMPOSED_HOP_INVALID = -1.0e6   # destination for a composed track whose hop left the image
@@ -780,7 +782,14 @@ class MemfofTemporalBackend:
 
     supports_reverse = False
 
-    def __init__(self, *, device: str, checkpoint: str = MEMFOF_DEFAULT_CHECKPOINT, max_side: int = 1920):
+    def __init__(
+        self,
+        *,
+        device: str,
+        checkpoint: str = MEMFOF_DEFAULT_CHECKPOINT,
+        max_side: int = 1920,
+        batch_size: int = MEMFOF_DEFAULT_BATCH_SIZE,
+    ):
         try:
             from memfof import MEMFOF
         except ImportError as exc:  # pragma: no cover - depends on the environment
@@ -791,14 +800,15 @@ class MemfofTemporalBackend:
         self.device = device
         self.checkpoint = str(checkpoint)
         self.max_side = int(max_side)
+        self.batch_size = max(int(batch_size), 1)
         self._model = MEMFOF.from_pretrained(self.checkpoint).eval().to(device)
         self.name = f"memfof[{self.checkpoint.rsplit('/', 1)[-1]}]"
 
-    def triplet_flows(
+    def _triplet_input(
         self, image_prev: np.ndarray, image_t: np.ndarray, image_next: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, float]:
-        """Backward and forward flow of the middle frame ([2,h,w] float16) and the
-        full->reduced scale."""
+    ) -> tuple[np.ndarray, int, int, float]:
+        """One MEMFOF input [3, hp, wp, 3] float32 (resized, padded to a multiple of 32 by
+        edge replication), the reduced size (h, w) and the full->reduced scale."""
         H, W = image_t.shape[:2]
         scale = min(1.0, float(self.max_side) / float(max(H, W)))
         w, h = int(round(W * scale)), int(round(H * scale))
@@ -809,12 +819,108 @@ class MemfofTemporalBackend:
             stack[i, :h, :w] = small
             stack[i, h:, :w] = small[-1:]
             stack[i, :, w:] = stack[i, :, w - 1:w]
-        inp = torch.from_numpy(stack).permute(0, 3, 1, 2).unsqueeze(0).to(self.device)
-        with torch.inference_mode():
-            bwd, fwd = self._model(inp)["flow"][-1].unbind(dim=1)
-        bwd = bwd[0, :, :h, :w].float().cpu().numpy().astype(np.float16)
-        fwd = fwd[0, :, :h, :w].float().cpu().numpy().astype(np.float16)
-        return bwd, fwd, scale
+        return stack, h, w, scale
+
+    def _infer(self, stacks: np.ndarray, h: int, w: int) -> np.ndarray:
+        """Flows [B, 2 (bwd, fwd), 2, h, w] float16 for B stacked inputs [B, 3, hp, wp, 3].
+
+        Runs in sub-batches of ``self.batch_size``. On CUDA out-of-memory the batch size is
+        halved (and stays halved for later calls) and the sub-batch is retried; only an OOM
+        at batch size 1 is raised. The float32 flow is rounded to float16 on the device,
+        which is the same round-to-nearest-even as numpy's astype on the host."""
+        out = np.empty((len(stacks), 2, 2, h, w), np.float16)
+        start = 0
+        while start < len(stacks):
+            bs = min(self.batch_size, len(stacks) - start)
+            oom = False
+            try:
+                inp = torch.from_numpy(stacks[start:start + bs]).permute(0, 1, 4, 2, 3).to(self.device)
+                with torch.inference_mode():
+                    flow = self._model(inp)["flow"][-1]
+                    out[start:start + bs] = flow[:, :, :, :h, :w].half().cpu().numpy()
+                del inp, flow
+            except torch.cuda.OutOfMemoryError:
+                if bs <= 1:
+                    raise
+                oom = True
+            if oom:
+                # Outside the except block, so the failed forward's tensors are released.
+                self.batch_size = max(bs // 2, 1)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"  [memfof] CUDA out of memory at batch {bs}; continuing with batch {self.batch_size}")
+                continue
+            start += bs
+        return out
+
+    def triplet_flows(
+        self, image_prev: np.ndarray, image_t: np.ndarray, image_next: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Backward and forward flow of the middle frame ([2,h,w] float16) and the
+        full->reduced scale."""
+        images = (image_prev, image_t, image_next)
+        return self.triplet_flows_batch([(0, 1, 2)], images.__getitem__)[0]
+
+    def triplet_flows_batch(
+        self,
+        triplets: Sequence[tuple[Hashable, Hashable, Hashable]],
+        fetch: Callable[[Hashable], np.ndarray],
+    ) -> list[tuple[np.ndarray, np.ndarray, float]]:
+        """``triplet_flows`` for many triplets, in input order, batched on the GPU.
+
+        Each triplet names its (t-d, t, t+d) images by key; ``fetch(key)`` returns the image.
+        A worker thread fetches the images and builds the inputs of the next batch while the
+        GPU runs the current one; each image is fetched once and dropped after its last use.
+        Consecutive triplets of the same image size share a batch, so the flows of a triplet
+        do not depend on its neighbours beyond floating-point rounding of the batched kernels.
+        """
+        triplets = [tuple(t) for t in triplets]
+        n = len(triplets)
+        if n == 0:
+            return []
+        last_use: dict = {}
+        for i, keys in enumerate(triplets):
+            for key in keys:
+                last_use[key] = i
+        held: dict = {}
+
+        def build(start: int):
+            # A chunk is the run of consecutive same-size triplets from ``start``, at most
+            # the current batch size long.
+            limit = max(self.batch_size, 1)
+            stacks, scales, size = [], [], None
+            i = start
+            while i < n and len(stacks) < limit:
+                keys = triplets[i]
+                for k in keys:
+                    if k not in held:
+                        held[k] = fetch(k)
+                ims = [held[k] for k in keys]
+                stack, h, w, scale = self._triplet_input(*ims)
+                if size is not None and (h, w, stack.shape) != size:
+                    break
+                size = (h, w, stack.shape)
+                # Release an image once the last triplet using it has joined a chunk.
+                for k in keys:
+                    if last_use[k] <= i:
+                        held.pop(k, None)
+                stacks.append(stack)
+                scales.append(scale)
+                i += 1
+            return start, i, np.stack(stacks, axis=0), size[0], size[1], scales
+
+        results: list = [None] * n
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(build, 0)
+            while pending is not None:
+                start, stop, stacks, h, w, scales = pending.result()
+                pending = pool.submit(build, stop) if stop < n else None
+                flows = self._infer(stacks, h, w)
+                for j in range(stop - start):
+                    # Own arrays, so dropping one direction frees it.
+                    results[start + j] = (flows[j, 0].copy(), flows[j, 1].copy(), scales[j])
+                del flows, stacks
+        return results
 
     @staticmethod
     def make_dense(flow: np.ndarray, scale: float, h: int, w: int) -> DenseMatch:
@@ -824,10 +930,10 @@ class MemfofTemporalBackend:
         )
 
     @staticmethod
-    def make_composed_dense(flow: np.ndarray, scale: float, h: int, w: int, hops) -> DenseMatch:
-        """A t -> t+-d warp that also carries d one-frame hop flows [(flow, scale), ...] in order.
-        Sampling it composes the hops (see sample_at_uvs); ``flow`` (the direct t -> t+-d flow) is
-        kept for layout validation only."""
+    def make_composed_dense(flow: Optional[np.ndarray], scale: float, h: int, w: int, hops) -> DenseMatch:
+        """A t -> t+-d warp made of d one-frame hop flows [(flow, scale), ...] in order.
+        Sampling it composes the hops (see sample_at_uvs), and so does layout validation;
+        ``flow`` (the direct t -> t+-d flow) is optional and never sampled."""
         dense = MemfofTemporalBackend.make_dense(flow, scale, h, w)
         dense.payload["hops"] = [(f, float(s)) for f, s in hops]
         return dense
